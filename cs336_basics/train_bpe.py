@@ -12,34 +12,26 @@ import pickle
 from tqdm import tqdm
 
 def _process_chunks_star(args):
-    """
-    Small wrapper to unpack (chunk, special_tokens) for imap_unordered.
-    Keeping process_chunks() signature unchanged.
-    """
     chunk, special_tokens = args
     return process_chunks(chunk, special_tokens)
 
 def _process_chunk_file_and_cleanup(args):
-    """
-    Wrapper for disk-streaming: process a chunk file and remove it immediately.
-    This enables streaming updates + early cleanup while keeping the original
-    process_chunk_from_file() unchanged.
-    """
     chunk_file_path, special_tokens = args
     try:
         return process_chunk_from_file(chunk_file_path, special_tokens)
     finally:
-        # Best-effort cleanup; ignore failures (e.g., already removed)
         try:
             os.remove(chunk_file_path)
         except OSError:
             pass
+
 # Pre-Tokenization:
 
 def divide_chunks(
     file: BinaryIO,
     num_chunks: int,
-    special_token: bytes):
+    special_token: bytes
+):
 
     file.seek(0, os.SEEK_END)
     size = file.tell()
@@ -94,10 +86,6 @@ def process_chunk_from_file(
     chunk_file_path: str,
     special_tokens: list[str]
 ):
-    """
-    Process a chunk that was saved to disk.
-    This is a wrapper function for disk-based streaming processing.
-    """
     with open(chunk_file_path, 'rb') as f:
         chunk = f.read()
     return process_chunks(chunk, special_tokens)
@@ -134,11 +122,6 @@ def pre_tokenization_disk_streaming(
     num_chunks: int,
     num_cpus: int
 ):
-    """
-    Disk-based streaming version of pre-tokenization.
-    Saves chunks to disk first, then processes them with streaming updates.
-    This reduces memory usage by not keeping all chunks in memory simultaneously.
-    """
     logging.info("  Using disk-based streaming for pre-tokenization...")
     
     # Create temporary directory for chunks
@@ -200,21 +183,6 @@ def pre_tokenization(
     num_chunks: int = None,
     use_disk_streaming: bool = False
 ):
-    """
-    Pre-tokenization with support for both in-memory and disk-based streaming processing.
-
-    Changes:
-      - In the multi-process path, switch to imap_unordered() so each chunk's result
-        updates `pre_tokens` immediately (streaming merge), instead of collecting
-        all per-chunk Counters and merging afterwards.
-    
-    Args:
-        file: Input file to tokenize
-        special_tokens: List of special tokens
-        set_cpus: Number of CPUs to use for parallel processing (default: mp.cpu_count()-1)
-        num_chunks: Number of chunks to divide the file into (default: same as set_cpus)
-        use_disk_streaming: If True, use disk-based streaming to reduce memory usage
-    """
     max_cpu = max(1, mp.cpu_count() - 1)
     
     # Determine number of CPUs to use
