@@ -202,8 +202,7 @@ def pre_tokenization(
     logging.info(f"  Disk streaming: {'Enabled' if use_disk_streaming else 'Disabled'}")
     
     # If disk streaming is enabled, use the disk-based version
-    if use_disk_streaming:
-        return pre_tokenization_disk_streaming(file, special_tokens, actual_num_chunks, num_usecpu)
+ 
     
     # In-memory processing logic
     chunk_boundaries = divide_chunks(file, actual_num_chunks, b'<|endoftext|>')
