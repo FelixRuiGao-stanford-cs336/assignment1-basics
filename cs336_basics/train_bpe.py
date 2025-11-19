@@ -9,20 +9,32 @@ from datetime import datetime
 import tempfile
 import shutil
 import pickle
-from torch._decomp.decompositions import one_layer_lstm
 from tqdm import tqdm
 
+def _process_chunks_star(args):
+    """
+    Small wrapper to unpack (chunk, special_tokens) for imap_unordered.
+    Keeping process_chunks() signature unchanged.
+    """
+    chunk, special_tokens = args
+    return process_chunks(chunk, special_tokens)
 
+def _process_chunk_file_and_cleanup(args):
+    """
+    Wrapper for disk-streaming: process a chunk file and remove it immediately.
+    This enables streaming updates + early cleanup while keeping the original
+    process_chunk_from_file() unchanged.
+    """
+    chunk_file_path, special_tokens = args
+    try:
+        return process_chunk_from_file(chunk_file_path, special_tokens)
+    finally:
+        # Best-effort cleanup; ignore failures (e.g., already removed)
+        try:
+            os.remove(chunk_file_path)
+        except OSError:
+            pass
 # Pre-Tokenization:
-
-def process_args(args):
-    c, st, only = args
-    return process_chunks(c, st, only)
-
-def process_args_from_file(args):
-    path, st, only = args
-    cnt = process_chunk_from_file(path, st, only)
-    return (path, cnt)
 
 def divide_chunks(
     file: BinaryIO,
@@ -59,48 +71,28 @@ def divide_chunks(
 
     return sorted(list(final_boundaries))
     
-
+    
 def process_chunks(
     chunk: bytes,
-    special_tokens: list[str],
-    only_pre_tokens_freq: bool = True
+    special_tokens: list[str]
 ):
     chunk_string = chunk.decode('utf-8', errors="ignore")
-    if only_pre_tokens_freq:
-        pat_special_token = re.compile("|".join(re.escape(special_token) for special_token in special_tokens))
-        text_split = [split_chunk for split_chunk in re.split(pat_special_token, chunk_string) if split_chunk]
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    pat_special_token = re.compile("|".join(re.escape(special_token) for special_token in special_tokens))
+    text_split = [split_chunk for split_chunk in re.split(pat_special_token, chunk_string) if split_chunk]
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-        pre_tokens_chunk = Counter()
-        for minichunk in text_split:
-            matches = re.finditer(PAT, minichunk)
-            for match in matches:
-                pre_token_int = tuple(match.group().encode('utf-8'))
-                pre_tokens_chunk[pre_token_int] += 1
-
-        return pre_tokens_chunk
-    
-    else:
-        pat_special_token = re.compile("("+"|".join(re.escape(special_token) for special_token in special_tokens)+")")
-        text_split = [split_chunk for split_chunk in re.split(pat_special_token, chunk_string) if split_chunk]
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
-        pre_tokens_chunk = []
-        for minichunk in text_split:
-            if minichunk in special_tokens:
-                pre_tokens_chunk.append(minichunk.encode('utf-8'))
-                continue
-            matches = re.finditer(PAT, minichunk)
-            for match in matches:
-                pre_tokens_chunk.append(match.group().encode('utf-8'))
-
-        return pre_tokens_chunk
+    pre_tokens_chunk = Counter()
+    for minichunk in text_split:
+        matches = re.finditer(PAT, minichunk)
+        for match in matches:
+            pre_token_int = tuple(match.group().encode('utf-8'))
+            pre_tokens_chunk[pre_token_int] += 1
+    return pre_tokens_chunk
 
 
 def process_chunk_from_file(
     chunk_file_path: str,
-    special_tokens: list[str], 
-    only_pre_tokens_freq: bool=True
+    special_tokens: list[str]
 ):
     """
     Process a chunk that was saved to disk.
@@ -108,7 +100,7 @@ def process_chunk_from_file(
     """
     with open(chunk_file_path, 'rb') as f:
         chunk = f.read()
-    return process_chunks(chunk, special_tokens, only_pre_tokens_freq)
+    return process_chunks(chunk, special_tokens)
 
 
 def save_chunks_to_disk(
@@ -140,12 +132,11 @@ def pre_tokenization_disk_streaming(
     file: BinaryIO,
     special_tokens: list[str],
     num_chunks: int,
-    num_cpus: int,
-    only_pre_tokens_freq: bool = True
+    num_cpus: int
 ):
     """
     Disk-based streaming version of pre-tokenization.
-    Saves chunks to disk first, then processes them one by one or in parallel.
+    Saves chunks to disk first, then processes them with streaming updates.
     This reduces memory usage by not keeping all chunks in memory simultaneously.
     """
     logging.info("  Using disk-based streaming for pre-tokenization...")
@@ -163,75 +154,43 @@ def pre_tokenization_disk_streaming(
         chunk_files = save_chunks_to_disk(file, chunk_boundaries, temp_dir)
         logging.info(f"  Saved all chunks to disk")
         
-        if only_pre_tokens_freq:
-            pre_tokens = Counter()
+        pre_tokens = Counter()
         
-            if num_cpus == 1:
-                # Process chunks sequentially
-                logging.info("  Processing chunks sequentially (1 CPU)...")
-                for chunk_file in tqdm(chunk_files, desc="  Pre-tokenization", unit="chunk"):
-                    chunk_pre_tokens = process_chunk_from_file(chunk_file, special_tokens)
-                    pre_tokens.update(chunk_pre_tokens)
-                    # Delete the chunk file immediately after processing to save space
+        if num_cpus == 1:
+            # Process chunks sequentially with streaming updates
+            logging.info("  Processing chunks sequentially (1 CPU)...")
+            for chunk_file in tqdm(chunk_files, desc="  Pre-tokenization", unit="chunk"):
+                chunk_pre_tokens = process_chunk_from_file(chunk_file, special_tokens)
+                pre_tokens.update(chunk_pre_tokens)
+                # Delete the chunk file immediately after processing to save space
+                try:
                     os.remove(chunk_file)
-            else:
-                # Process chunks in parallel
-                logging.info(f"  Processing chunks in parallel ({num_cpus} CPUs)...")
-                iteration_jobs = [(chunk_file, special_tokens, True) for chunk_file in chunk_files]
-        
-                with mp.Pool(processes=num_cpus) as pool:
-                    iterator = pool.imap_unordered(process_args_from_file, iteration_jobs, chunksize=1)
-                    for path, cnt in tqdm(iterator, total=len(iteration_jobs), desc="  Pre-tokenization", unit="chunk"):
-                        pre_tokens.update(cnt)
-                        if os.path.exists(path):
-                            os.remove(path)
-            
-                # Delete all chunk files
-                for chunk_file in chunk_files:
-                    if os.path.exists(chunk_file):
-                        os.remove(chunk_file)
-        
-            logging.info(f"  Disk-based streaming completed successfully")
-
+                except OSError:
+                    pass
         else:
-            pre_tokens_ordered = []
-        
-            if num_cpus == 1:
-                # Process chunks sequentially
-                logging.info("  Processing chunks sequentially (1 CPU)...")
-                for chunk_file in tqdm(chunk_files, desc="  Pre-tokenization", unit="chunk"):
-                    chunk_pre_tokens_ordered = process_chunk_from_file(chunk_file, special_tokens, False)
-                    pre_tokens_ordered += chunk_pre_tokens_ordered
-                    # Delete the chunk file immediately after processing to save space
-                    os.remove(chunk_file)
-            else:
-                # Process chunks in parallel
-                logging.info(f"  Processing chunks in parallel ({num_cpus} CPUs)...")
-                iteration_jobs = [(chunk_file, special_tokens, False) for chunk_file in chunk_files]
+            # Process chunks in parallel with streaming updates
+            logging.info(f"  Processing chunks in parallel ({num_cpus} CPUs) with streaming updates...")
+            iteration_jobs = [(chunk_file, special_tokens) for chunk_file in chunk_files]
     
-                with mp.Pool(processes=num_cpus) as pool:
-                    iterator = pool.imap(process_args_from_file, iteration_jobs, chunksize=1)
-                    for path, cnt in tqdm(iterator, total=len(iteration_jobs), desc="  Pre-tokenization", unit="chunk"):
-                        pre_tokens_ordered += cnt
-                        if os.path.exists(path):
-                            os.remove(path)
-            
-                # Delete all chunk files
-                for chunk_file in chunk_files:
-                    if os.path.exists(chunk_file):
-                        os.remove(chunk_file)
+            # Stream results as they complete and update pre_tokens immediately
+            with mp.Pool(processes=num_cpus) as pool:
+                for chunk_result in tqdm(
+                    pool.imap_unordered(_process_chunk_file_and_cleanup, iteration_jobs),
+                    total=len(iteration_jobs),
+                    desc="  Pre-tokenization",
+                    unit="chunk"
+                ):
+                    pre_tokens.update(chunk_result)
         
-            logging.info(f"  Disk-based streaming completed successfully")
+        logging.info(f"  Disk-based streaming completed successfully")
         
     finally:
-        # Clean up temporary directory
+        # Clean up temporary directory (best-effort; files should already be removed)
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
             logging.info(f"  Cleaned up temporary directory: {temp_dir}")
     
-    if only_pre_tokens_freq:
-        return pre_tokens
-    return pre_tokens_ordered
+    return pre_tokens
 
 
 def pre_tokenization(
@@ -239,11 +198,15 @@ def pre_tokenization(
     special_tokens: list[str],
     set_cpus: int = None,
     num_chunks: int = None,
-    use_disk_streaming: bool = False, 
-    only_pre_tokens_freq: bool = True
+    use_disk_streaming: bool = False
 ):
     """
     Pre-tokenization with support for both in-memory and disk-based streaming processing.
+
+    Changes:
+      - In the multi-process path, switch to imap_unordered() so each chunk's result
+        updates `pre_tokens` immediately (streaming merge), instead of collecting
+        all per-chunk Counters and merging afterwards.
     
     Args:
         file: Input file to tokenize
@@ -258,7 +221,7 @@ def pre_tokenization(
     if set_cpus is None:
         num_usecpu = max_cpu
     else:
-        num_usecpu = set_cpus if 0 < set_cpus and set_cpus <= max_cpu else max_cpu
+        num_usecpu = set_cpus if set_cpus <= max_cpu else max_cpu
     
     # Determine number of chunks
     if num_chunks is None:
@@ -270,68 +233,39 @@ def pre_tokenization(
     logging.info(f"  Number of CPUs: {num_usecpu}")
     logging.info(f"  Disk streaming: {'Enabled' if use_disk_streaming else 'Disabled'}")
     
-    if only_pre_tokens_freq:
-        # If disk streaming is enabled, use the disk-based version
-        if use_disk_streaming:
-            return pre_tokenization_disk_streaming(file, special_tokens, actual_num_chunks, num_usecpu, False)  
-        # Original in-memory processing logic
-        chunk_boundaries = divide_chunks(file, actual_num_chunks, b'<|endoftext|>')
-
-        chunks = []
-        pre_tokens = Counter()
+    # If disk streaming is enabled, use the disk-based version
+    if use_disk_streaming:
+        return pre_tokenization_disk_streaming(file, special_tokens, actual_num_chunks, num_usecpu)
     
-        for i in range(len(chunk_boundaries)-1):
-            file.seek(chunk_boundaries[i])
-            chunks.append(file.read(chunk_boundaries[i+1]-chunk_boundaries[i]))
+    # In-memory processing logic
+    chunk_boundaries = divide_chunks(file, actual_num_chunks, b'<|endoftext|>')
+    chunks = []
+    pre_tokens = Counter()
+    
+    for i in range(len(chunk_boundaries)-1):
+        file.seek(chunk_boundaries[i])
+        chunks.append(file.read(chunk_boundaries[i+1]-chunk_boundaries[i]))
 
-        if num_usecpu == 1:
-            logging.info("  Processing chunk with progress bar...")
-            for chunk in tqdm(chunks, desc="  Pre-tokenization", unit="chunk"):
-                chunk_result = process_chunks(chunk=chunk, special_tokens=special_tokens)
-                pre_tokens.update(chunk_result)
-            return pre_tokens
-        
-        iteration_jobs = [(chunk, special_tokens, True) for chunk in chunks]
-
-        with mp.Pool(processes=num_usecpu) as pool:
-            iterator = pool.imap_unordered(process_args, iteration_jobs, chunksize=1)
-
-            for pre_tokens_by_chunk in tqdm(iterator, total=len(iteration_jobs), desc="  Pre-tokenization", unit="chunk"):
-                pre_tokens.update(pre_tokens_by_chunk)
-        
+    if num_usecpu == 1:
+        logging.info("  Processing chunk with progress bar...")
+        for chunk in tqdm(chunks, desc="  Pre-tokenization", unit="chunk"):
+            chunk_result = process_chunks(chunk=chunk, special_tokens=special_tokens)
+            pre_tokens.update(chunk_result)
         return pre_tokens
 
-    else:
-        if use_disk_streaming:
-            return pre_tokenization_disk_streaming(file, special_tokens, actual_num_chunks, num_usecpu, False)  
+    # Multi-process: stream results and update pre_tokens immediately
+    iteration_jobs = [(chunk, special_tokens) for chunk in chunks]
+    logging.info(f"  Processing chunks in parallel ({num_usecpu} CPUs) with streaming updates...")
+    with mp.Pool(processes=num_usecpu) as pool:
+        for pre_tokens_by_chunk in tqdm(
+            pool.imap_unordered(_process_chunks_star, iteration_jobs),
+            total=len(iteration_jobs),
+            desc="  Pre-tokenization",
+            unit="chunk"
+        ):
+            pre_tokens.update(pre_tokens_by_chunk)
         
-        chunk_boundaries = divide_chunks(file, actual_num_chunks, b'<|endoftext|>')
-
-        chunks = []
-        pre_tokens_ordered = []
-
-        for i in range(len(chunk_boundaries)-1):
-            file.seek(chunk_boundaries[i])
-            chunks.append(file.read(chunk_boundaries[i+1]-chunk_boundaries[i]))
-
-        if num_usecpu == 1:
-            logging.info("  Processing chunk with progress bar...")
-            for chunk in tqdm(chunks, desc="  Pre-tokenization", unit="chunk"):
-                chunk_result = process_chunks(chunk=chunk, special_tokens=special_tokens, only_pre_tokens_freq=False)
-                pre_tokens_ordered += chunk_result
-            return pre_tokens_ordered
-
-        iteration_jobs = [(chunk, special_tokens, False) for chunk in chunks]
-
-        with mp.Pool(processes=num_usecpu) as pool:
-            iterator = pool.imap(process_args, iteration_jobs, chunksize=1)
-
-            for pre_tokens_ordered_by_chunk in tqdm(iterator, total=len(iteration_jobs), desc="  Pre-tokenization", unit="chunk"):
-                pre_tokens_ordered += pre_tokens_ordered_by_chunk
-        
-        return pre_tokens_ordered
-
-
+    return pre_tokens
     
 
 # BPE:

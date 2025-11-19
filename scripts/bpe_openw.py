@@ -1,4 +1,4 @@
-from cs336_basics.train_bpe import train_bpe
+from cs336_basics.train_bpe_not_clean import train_bpe
 import pickle
 from pathlib import Path
 import argparse
